@@ -1,0 +1,40 @@
+schema: mcpg.dev/plugin/v1
+id: dev.mcpg.backend.sftp
+name: SFTP Binding
+license: Apache-2.0
+description: |
+  Lists a directory, gets a file, or puts a file over SFTP (SSH file
+  transfer) as MCP tools and resources. `op: list` returns directory entries;
+  `op: get` returns a file's contents (text or base64); `op: put` writes a
+  file from the `content`/`text` argument. The target path comes from the
+  call arguments (`..` rejected) and is joined under the operator-configured
+  `root`. Connects with russh + russh-sftp (pure-Rust SSH crypto); the
+  password resolves through the gateway secret-resolver (`${env.X}` /
+  `vault://...`). FTP and SMB are deferred follow-ons.
+
+  Set `surface: resource` to expose files as MCP RESOURCES instead of tools:
+  `resources/list` lists the configured `root`/`path` directory (one resource
+  per regular file — URI from the `uri` template `sftp://{path}`, name =
+  filename, mimeType guessed from the extension, size as the description) and
+  `resources/read` fetches a file as `{contents:[{uri,mimeType,text|blob}]}`
+  (UTF-8 → `text`, binary → base64 `blob`). `{path}` completion is served from
+  the directory listing. The default `surface: tool` keeps the list/get/put
+  tools unchanged.
+
+  A second `watch_strategy` entity (kind `sftp_dir_poll`) lets a resource
+  subscribe to directory changes by POLLING. Each watcher carries its own
+  connection (`host` / `port` / `username` / `password` / `host_key_sha256` /
+  `accept_unknown_host_key` / `root`) plus the `path` directory under `root` to
+  watch. The plugin LISTS that directory every `interval_ms` (default 60000,
+  floored at 250 ms) with a per-tick `timeout_ms` budget (default 10000), builds
+  a deterministic fingerprint of the listing (`name|size|mtime` per entry,
+  sorted), and emits `notifications/resources/updated` whenever the fingerprint
+  changes — i.e. a file is added, removed, or modified (the first tick only
+  establishes the baseline, so a watcher never fires spuriously at startup). The
+  watched `path` is held to the same `..`-rejecting traversal guard as the
+  backend; host-key verification fails closed (a pinned `host_key_sha256` or an
+  explicit `accept_unknown_host_key: true`); a `cred://` password is rejected.
+class: backend
+runtime: native-cdylib-v1
+protocol_version: "1.0"
+required_capabilities: [network_outbound]

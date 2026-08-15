@@ -1,0 +1,45 @@
+[package]
+name = "mcpg-plugin-backend-sftp"
+version = "0.1.0-alpha.15"
+license = "Apache-2.0"
+edition = "2024"
+description = """
+SFTP (SSH file transfer) backend binding plugin for mcpg. Lists a directory,
+gets a file, or puts a file over SSH (russh + russh-sftp) as MCP
+tools/resources — with path-traversal defense and a size cap. FTP (suppaftp)
+and SMB (pavao) are deferred follow-ons.
+"""
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+cdylib-export = []
+static-firstparty = []
+# Gates the docker-backed SFTP integration suite so plain `cargo test` stays
+# cheap. Run: `cargo test -p mcpg-plugin-backend-sftp --features integration-tests`.
+integration-tests = []
+
+[dependencies]
+mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+mcpg-plugin-sdk      = { git = "https://github.com/mcpg-dev/mcpg-plugin-sdk", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13", features = ["static-firstparty"] }
+mcpg-plugin-host     = { git = "https://github.com/mcpg-dev/mcpg-plugin-host", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+async-trait    = "0.1"
+base64         = "0.22"
+chrono         = { version = "0.4", features = ["clock"] }
+metrics        = "0.24"
+# SSH transport + SFTP subsystem (pure-Rust crypto — no openssl/native-tls).
+russh          = "0.62"
+russh-sftp     = "2"
+serde          = { version = "1", features = ["derive"] }
+serde_json     = "1"
+tokio          = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros", "time", "net", "io-util"] }
+tracing        = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "time"] }
+async-trait = "0.1"
+# Docker-backed SFTP integration test (async runner). Dev-dep only.
+testcontainers = "0.27"
+
