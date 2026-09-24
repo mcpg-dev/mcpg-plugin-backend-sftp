@@ -30,15 +30,23 @@ impl russh::client::Handler for ClientHandler {
 
     async fn check_server_key(
         &mut self,
-        server_public_key: &russh::keys::ssh_key::PublicKey,
+        server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
         if self.accept_any {
             return Ok(true);
         }
         if let Some(expected) = &self.expected_fingerprint {
-            let actual = server_public_key
-                .fingerprint(russh::keys::ssh_key::HashAlg::Sha256)
-                .to_string();
+            // A certificate host key is pinned by the key inside the
+            // certificate, the same key a plain host key would present.
+            let alg = russh::keys::ssh_key::HashAlg::Sha256;
+            let actual = match server_public_key {
+                russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } => {
+                    key.fingerprint(alg).to_string()
+                }
+                russh::keys::PublicKeyOrCertificate::Certificate(cert) => {
+                    cert.public_key().fingerprint(alg).to_string()
+                }
+            };
             return Ok(&actual == expected);
         }
         // Fail closed: neither a pinned fingerprint nor accept-any.
