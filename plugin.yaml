@@ -10,7 +10,7 @@ description: |
   call arguments (`..` rejected) and is joined under the operator-configured
   `root`. Connects with russh + russh-sftp (pure-Rust SSH crypto); the
   password resolves through the gateway secret-resolver (`${env.X}` /
-  `vault://...`). FTP and SMB are deferred follow-ons.
+  `vault://...`). The ftp and smb backends cover the other file protocols.
 
   Set `surface: resource` to expose files as MCP RESOURCES instead of tools:
   `resources/list` lists the configured `root`/`path` directory (one resource
@@ -21,16 +21,16 @@ description: |
   the directory listing. The default `surface: tool` keeps the list/get/put
   tools unchanged.
 
-  A second `watch_strategy` entity (kind `sftp_dir_poll`) lets a resource
-  subscribe to directory changes by POLLING. Each watcher carries its own
-  connection (`host` / `port` / `username` / `password` / `host_key_sha256` /
-  `accept_unknown_host_key` / `root`) plus the `path` directory under `root` to
-  watch. The plugin LISTS that directory every `interval_ms` (default 60000,
-  floored at 250 ms) with a per-tick `timeout_ms` budget (default 10000), builds
-  a deterministic fingerprint of the listing (`name|size|mtime` per entry,
-  sorted), and emits `notifications/resources/updated` whenever the fingerprint
-  changes — i.e. a file is added, removed, or modified (the first tick only
-  establishes the baseline, so a watcher never fires spuriously at startup). The
+  A second `watch_strategy` entity (kind `sftp_dir_poll`) watches a directory
+  by POLLING. Each watcher carries its own connection (`host` / `port` /
+  `username` / `password` / `host_key_sha256` / `accept_unknown_host_key` /
+  `root`) plus the `path` directory under `root` to watch. The plugin LISTS
+  that directory (and its subdirectories with `recursive`, files filtered by
+  an optional `pattern` glob) every `interval_ms` (default 60000, floored at
+  250 ms) over one session with a `timeout_ms` budget (default 10000). A
+  resource watch gets `notifications/resources/updated` whenever a file is
+  added, removed, or modified; an MCP Events source gets each such file as the
+  shared `object.changed` event and resumes exactly after a restart. The
   watched `path` is held to the same `..`-rejecting traversal guard as the
   backend; host-key verification fails closed (a pinned `host_key_sha256` or an
   explicit `accept_unknown_host_key: true`); a `cred://` password is rejected.
@@ -38,3 +38,21 @@ class: backend
 runtime: native-cdylib-v1
 protocol_version: "1.0"
 required_capabilities: [network_outbound]
+# MCP Events: the directory as an inventory of files.
+watch_strategies:
+  - kind: sftp_dir_poll
+    placement: single_owner
+    resume: true
+    event_types:
+      - name: object.changed
+        description: A file in the watched SFTP directory was created, modified or deleted.
+        payload_schema:
+          type: object
+          required: [op, store, location, key]
+          properties:
+            op: { enum: [created, modified, deleted] }
+            store: { type: string, description: The kind of store - sftp here. }
+            location: { type: string, description: "sftp://host:port/directory, without credentials." }
+            key: { type: string, description: The file's path relative to location. }
+            size: { type: integer }
+            modifiedAt: { type: string, description: When it last changed, RFC 3339. }

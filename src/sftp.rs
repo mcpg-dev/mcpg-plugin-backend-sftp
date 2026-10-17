@@ -122,6 +122,44 @@ pub async fn list(conn: &SftpConn, path: &str) -> Result<Vec<Value>, String> {
     Ok(entries)
 }
 
+/// One SFTP session that lists the directories under a root, for a watch
+/// that walks a tree.
+pub struct SftpLister {
+    /// Owns the connection task; kept alive while `sftp` is used.
+    _handle: Handle<ClientHandler>,
+    sftp: SftpSession,
+    root: String,
+}
+
+impl SftpLister {
+    /// Connect and open the session; directories are listed under `root`.
+    pub async fn open(conn: &SftpConn, root: &str) -> Result<Self, String> {
+        let (handle, sftp) = open_session(conn).await?;
+        Ok(Self {
+            _handle: handle,
+            sftp,
+            root: root.to_owned(),
+        })
+    }
+
+    /// The entries of the directory `relative` to the root (`""` for the
+    /// root itself).
+    pub async fn list(&self, relative: &str) -> Result<Vec<Value>, String> {
+        let dir = match (self.root.as_str(), relative) {
+            (root, "") => root.to_owned(),
+            (".", _) => relative.to_owned(),
+            (root, _) => format!("{}/{relative}", root.trim_end_matches('/')),
+        };
+        Ok(self
+            .sftp
+            .read_dir(&dir)
+            .await
+            .map_err(|e| format!("SFTP list '{dir}' failed: {e}"))?
+            .map(entry_to_json)
+            .collect())
+    }
+}
+
 /// Read a file's contents (capped at `max_bytes`).
 pub async fn get(conn: &SftpConn, path: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
     let (_handle, sftp) = open_session(conn).await?;

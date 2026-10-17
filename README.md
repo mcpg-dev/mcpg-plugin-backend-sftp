@@ -151,10 +151,12 @@ populates `written`.
 
 ## Directory watch (`watch_strategy`, kind `sftp_dir_poll`)
 
-A second entity lets a resource subscribe to **directory changes by polling**.
-SFTP has no native change-push channel, so the watcher LISTS a directory on a
-cadence and signals a change whenever the listing's content moves — a file
-added, removed, or modified.
+A second entity watches a directory **by polling**. SFTP has no native
+change-push channel, so the watcher lists the directory on a cadence and
+compares each listing with the last one the gateway stored. A resource watch
+gets `notifications/resources/updated` when a file is added, removed, or
+modified; an MCP Events source gets each such file as the shared
+`object.changed` event (see MCP Events, "Files and objects").
 
 Each watcher carries its own connection plus the directory to watch:
 
@@ -168,17 +170,26 @@ Each watcher carries its own connection plus the directory to watch:
 | `path` | string | `""` | Directory under `root` to watch (`""` = `root`). `..` segments are **rejected**. |
 | `host_key_sha256` | string | — | Pinned server host-key fingerprint (`SHA256:…`). |
 | `accept_unknown_host_key` | bool | `false` | Accept any host key — **dev only**. With neither this nor `host_key_sha256`, the watch is rejected. |
-| `interval_ms` | int | `60000` | Poll cadence (floored at 250 ms by the SDK helper). |
-| `timeout_ms` | int | `10000` | Per-tick connect + list budget. |
+| `interval_ms` | int | `60000` | Listing cadence (at least 250 ms). |
+| `timeout_ms` | int | `10000` | Budget of one listing: connect and every directory. |
+| `recursive` | bool | `false` | Go into subdirectories, at most 1000 of them. |
+| `pattern` | string | — | Keep only the files whose path relative to the directory matches this glob: `*` stays in a directory, `**` crosses them (`**/*.csv`). |
+| `max_files` | int | `10000` | Most files listed (1 to 100000); past it the first in path order are kept, with a warning. |
+| `start_at` | `now` \| `existing` | `now` | `now`: the files there at a first start are the baseline. `existing`: each is reported as created. |
+| `snapshot_bytes` | int | `131072` | Largest snapshot of the listing an event carries, for an exact restart (at most 196608). |
+| `max_in_flight` | int | `256` | Most changes emitted ahead of the gateway's acknowledgements (1 to 1000). |
+| `ack_timeout_ms` | int | `60000` | How long a change waits for its acknowledgement before it is offered again. |
 
-Each tick the watcher opens a connection, lists `path`, and builds a
-deterministic **fingerprint** — each entry rendered as `name|size|mtime`,
-sorted, joined — so the comparison is order-independent and changes iff a file
-is added, removed, or modified. The host turns a fingerprint change into a
-`notifications/resources/updated` event. The first successful tick establishes
-the baseline without firing, so a watcher never fires spuriously at startup. A
-connect/list failure at watch start fails the subscription; a transient failure
-mid-watch is logged and retried on the next tick.
+Each listing opens one connection, lists `path` (and its subdirectories),
+and drops the connection. Keys are file paths relative to `path`, with `/`
+between parts; `location` is `sftp://host:port/<directory>`, without
+credentials. A directory that cannot be listed fails the whole listing, and
+the next interval tries again, so a part that cannot be read is never
+reported as deleted. An unreachable server does not fail the watch: it is
+listed again at the next interval. SFTP reports a file's time to the second,
+so an overwrite that keeps the size within the same second is not seen.
+
+As a resource watch:
 
 ```yaml
 mcp:
@@ -187,8 +198,9 @@ mcp:
       - uri: sftp://partner/incoming
         name: Partner drop directory
         watch:
-          kind: sftp_dir_poll
-          spec:
+          strategy:
+            type: plugin
+            kind: sftp_dir_poll
             host: "sftp.partner.example.com"
             username: "svc-mcpg"
             password: "${env.SFTP_PASSWORD}"
@@ -198,19 +210,42 @@ mcp:
             interval_ms: 30000
 ```
 
+As an MCP Events source, each file as `object.changed`:
+
+```yaml
+mcp:
+  capabilities:
+    events:
+      - name: partner.drops
+        description: A CSV arrived in, changed in, or left the partner's drop folder.
+        source:
+          watch:
+            strategy:
+              type: plugin
+              kind: sftp_dir_poll
+              host: "sftp.partner.example.com"
+              username: "svc-mcpg"
+              password: "${env.SFTP_PASSWORD}"
+              host_key_sha256: "SHA256:abc123…"
+              root: "/outbound"
+              path: "incoming"
+              recursive: true
+              pattern: "**/*.csv"
+            event_type: object.changed
+```
+
 ## Build / test
 
 ```bash
-nx build mcpg-plugin-backend-sftp
-nx test  mcpg-plugin-backend-sftp                                   # unit tests
-cargo test -p mcpg-plugin-backend-sftp --features integration-tests  # atmoz/sftp (docker)
-nx lint  mcpg-plugin-backend-sftp
+cargo build  -p mcpg-plugin-backend-sftp
+cargo test   -p mcpg-plugin-backend-sftp                              # unit tests
+cargo test   -p mcpg-plugin-backend-sftp --features integration-tests # atmoz/sftp (docker)
+cargo clippy -p mcpg-plugin-backend-sftp --all-targets -- -D warnings
 ```
 
 ## Scope / deferred
 
 - **Public-key auth** — v1 is password auth; key auth is a follow-on.
-- **FTP / SMB** — separate plugins (`suppaftp` / `pavao`), deferred.
 - **Recursive / streaming transfers, rename/mkdir/rm** — v1 is single-file
   `list` / `get` / `put`.
 - **Connection pooling** — v1 connects per call (SSH handshake per op).

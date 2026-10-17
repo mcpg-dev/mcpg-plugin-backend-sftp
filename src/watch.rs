@@ -1,46 +1,40 @@
-//! `watch_strategy` entity (`sftp_dir_poll`) — POLLING directory-change watch.
+//! `watch_strategy` entity (`sftp_dir_poll`): a directory on an SFTP server
+//! as an inventory.
 //!
-//! SFTP has no native change-push channel, so this strategy LISTS a directory
-//! on a cadence and signals a change whenever the listing's content changes (a
-//! file added, removed, or modified). The cursor is a deterministic FINGERPRINT
-//! of the listing — each entry rendered as `name|size|mtime`, sorted, joined —
-//! so the comparison is order-independent and stable across ticks. The poll
-//! thread, the cursor diff, the stop signal, and the opaque handle round-trip
-//! all live in the shared [`mcpg_plugin_sdk::watch`] helper; this entity only
-//! supplies the per-tick `poll` closure.
-//!
-//! SFTP (russh) is async and per-call: a connection is opened, listed, and
-//! dropped each tick. The helper's loop is synchronous, so a single
-//! current-thread tokio runtime is built once in [`watch`] and moved into the
-//! closure; each tick `block_on`s one connect + list (sequential ticks, so a
-//! single-thread runtime is enough). Connect / list failures map to the
-//! closure's `Err(String)` — the helper logs and retries on the next tick.
+//! SFTP has no change-push channel, so the strategy lists the directory
+//! (and its subdirectories with `recursive`) every `interval_ms`. A resource
+//! watch gets one change per listing that changed anything; an MCP Events
+//! source gets each file created, modified or deleted as the shared
+//! `object.changed` event, through the SDK's inventory helper, which also
+//! resumes after a restart. Each listing opens one connection, walks, and
+//! drops it.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use mcpg_plugin_protocol::backend::WatchError;
 use mcpg_plugin_protocol::{PluginManifest, firstparty_manifest};
 use mcpg_plugin_sdk::HostHandle;
 use mcpg_plugin_sdk::ffi::{SyncWatchStrategyPlugin, WatchHandleBox};
-use mcpg_plugin_sdk::watch::{cancel_polling_watch, spawn_polling_watch};
+use mcpg_plugin_sdk::inventory::{
+    DirItem, InventoryOptions, InventoryStart, Pattern, WalkOptions, acknowledge_inventory_watch,
+    cancel_inventory_watch, defaults, spawn_inventory_watch, walk,
+};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::sftp::{self, SftpConn};
+use crate::sftp::{self, SftpConn, SftpLister};
 
 pub const PLUGIN_ID: &str = "dev.mcpg.backend.sftp";
 
 /// The strategy discriminator this entity handles.
 pub const WATCH_KIND: &str = "sftp_dir_poll";
 
-/// Default poll cadence when `interval_ms` is omitted (1 minute).
+/// Default listing cadence when `interval_ms` is omitted (1 minute).
 fn default_interval_ms() -> u64 {
     60_000
 }
 
-/// Default per-tick connect + list budget when `timeout_ms` is omitted
-/// (10 seconds).
+/// Default budget of one listing when `timeout_ms` is omitted (10 seconds).
 fn default_timeout_ms() -> u64 {
     10_000
 }
@@ -50,9 +44,9 @@ fn default_port() -> u16 {
 }
 
 /// Per-watch spec: the SFTP connection fields (mirroring the backend's
-/// connection shape) plus the directory `path` under `root` to watch and the
-/// poll cadence. The connection is carried per-watch (not at plugin level), so
-/// a watcher is self-contained.
+/// connection shape), the directory under `root` to watch, and how it is
+/// listed. The connection is carried per watch, so a watcher is
+/// self-contained.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WatchSpec {
@@ -63,8 +57,8 @@ struct WatchSpec {
     port: u16,
     /// SSH login user.
     username: String,
-    /// SSH password — a literal, or `${env.X}` / `vault://…` resolved at config
-    /// load. Per-caller `cred://` is rejected.
+    /// SSH password: a literal, `${env.X}`, `${secret.X}` or `vault://…`,
+    /// resolved before the watch starts. Per-caller `cred://` is rejected.
     password: String,
     /// Base directory the watched `path` is joined under (default `""` = the
     /// login's default directory).
@@ -81,12 +75,35 @@ struct WatchSpec {
     /// Accept any (unverified) server host key. Dev/test only.
     #[serde(default)]
     accept_unknown_host_key: bool,
-    /// Poll cadence in milliseconds (default 60000; floored by the SDK helper).
+    /// Listing cadence in milliseconds (default 60000, at least 250).
     #[serde(default = "default_interval_ms")]
     interval_ms: u64,
-    /// Per-tick connect + list budget in milliseconds (default 10000).
+    /// Budget of one listing in milliseconds (default 10000).
     #[serde(default = "default_timeout_ms")]
     timeout_ms: u64,
+    /// List the subdirectories too.
+    #[serde(default)]
+    recursive: bool,
+    /// Keep only the files whose path relative to the directory matches
+    /// this glob (`*.csv`, `**/*.json`).
+    #[serde(default)]
+    pattern: Option<String>,
+    /// Most files listed (default 10000).
+    #[serde(default = "defaults::max_files")]
+    max_files: usize,
+    /// `now` (default): the files there at a first start are the baseline;
+    /// `existing`: each is reported as created.
+    #[serde(default)]
+    start_at: InventoryStart,
+    /// Largest snapshot of the listing an event carries (default 131072).
+    #[serde(default = "defaults::snapshot_bytes")]
+    snapshot_bytes: usize,
+    /// Most changes emitted ahead of the gateway's acknowledgements.
+    #[serde(default = "defaults::max_in_flight")]
+    max_in_flight: usize,
+    /// How long a change waits for its acknowledgement (default 60000).
+    #[serde(default = "defaults::ack_timeout_ms")]
+    ack_timeout_ms: u64,
 }
 
 /// `watch_strategy` entity. Stateless beyond its manifest — every watcher's
@@ -110,33 +127,38 @@ impl SftpWatchCdylib {
     }
 }
 
-/// Build a deterministic fingerprint of a directory listing. Each entry is
-/// rendered as `name|size|mtime`; the lines are SORTED then joined by `\n`, so
-/// the result is order-independent (the server's listing order does not matter)
-/// and changes iff a file is added, removed, or modified (size/mtime move).
-fn fingerprint_listing(entries: &[Value]) -> String {
-    let mut lines: Vec<String> = entries
-        .iter()
-        .map(|e| {
-            let name = e.get("name").and_then(Value::as_str).unwrap_or("");
-            let size = e.get("size").map(value_scalar).unwrap_or_default();
-            let mtime = e.get("mtime").map(value_scalar).unwrap_or_default();
-            format!("{name}|{size}|{mtime}")
-        })
-        .collect();
-    lines.sort();
-    lines.join("\n")
+/// Run one step of a listing on `rt`, failing when the listing's `deadline`
+/// passes.
+fn within<T>(
+    rt: &tokio::runtime::Runtime,
+    deadline: tokio::time::Instant,
+    step: impl Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    rt.block_on(async {
+        tokio::time::timeout_at(deadline, step)
+            .await
+            .map_err(|_| "sftp listing timed out".to_owned())?
+    })
 }
 
-/// Render a JSON scalar to a stable string for the fingerprint. Strings yield
-/// their bare value; everything else its JSON rendering; null/missing yields the
-/// empty string.
-fn value_scalar(v: &Value) -> String {
-    match v {
-        Value::String(s) => s.clone(),
-        Value::Null => String::new(),
-        other => other.to_string(),
-    }
+/// One listing entry as the inventory reads it; `None` for an entry that is
+/// neither a file nor a directory.
+fn dir_item(entry: &Value) -> Option<DirItem> {
+    let name = entry.get("name").and_then(Value::as_str)?.to_owned();
+    let is_dir = match entry.get("type").and_then(Value::as_str) {
+        Some("dir") => true,
+        Some("file") => false,
+        _ => return None,
+    };
+    Some(DirItem {
+        name,
+        is_dir,
+        size: entry.get("size").and_then(Value::as_u64),
+        modified_at_ms: entry
+            .get("mtime")
+            .and_then(Value::as_i64)
+            .map(|secs| secs.saturating_mul(1_000)),
+    })
 }
 
 impl SyncWatchStrategyPlugin for SftpWatchCdylib {
@@ -154,8 +176,9 @@ impl SyncWatchStrategyPlugin for SftpWatchCdylib {
         spec: &Value,
         emit_event: Box<dyn Fn(&str) + Send + Sync + 'static>,
     ) -> Result<WatchHandleBox, WatchError> {
+        let (spec, resume) = mcpg_plugin_protocol::take_watch_resume(spec);
         let parsed: WatchSpec =
-            serde_json::from_value(spec.clone()).map_err(|e| WatchError::InvalidSpec {
+            serde_json::from_value(spec).map_err(|e| WatchError::InvalidSpec {
                 message: format!("invalid sftp_dir_poll watch spec: {e}"),
             })?;
 
@@ -172,7 +195,7 @@ impl SyncWatchStrategyPlugin for SftpWatchCdylib {
         if parsed.password.starts_with("cred://") {
             return Err(invalid(
                 "password must not be a cred:// URI — per-caller credentials are unsupported; \
-                 use ${env.X} / vault:// (resolved at config load)"
+                 use ${env.X} / ${secret.X} / vault:// (resolved before the watch starts)"
                     .into(),
             ));
         }
@@ -188,9 +211,24 @@ impl SyncWatchStrategyPlugin for SftpWatchCdylib {
                     .into(),
             ));
         }
+        if !(1..=100_000).contains(&parsed.max_files) {
+            return Err(invalid("max_files must be 1 to 100000".into()));
+        }
+        let pattern = parsed
+            .pattern
+            .as_deref()
+            .map(Pattern::new)
+            .transpose()
+            .map_err(|e| invalid(format!("pattern: {e}")))?;
         // Reuse the backend's path-traversal guard (rejects `..` segments) so a
         // watcher can never escape `root`.
         let resolved = sftp::resolve_path(&parsed.root, &parsed.path).map_err(invalid)?;
+        let location = format!(
+            "sftp://{}:{}/{}",
+            parsed.host,
+            parsed.port,
+            resolved.trim_start_matches('/')
+        );
 
         let conn = SftpConn {
             host: parsed.host,
@@ -200,53 +238,57 @@ impl SyncWatchStrategyPlugin for SftpWatchCdylib {
             host_key_sha256: parsed.host_key_sha256,
             accept_unknown_host_key: parsed.accept_unknown_host_key,
         };
-
-        // One current-thread runtime, moved into the closure: ticks are
-        // sequential, so a single-thread runtime is enough to `block_on` each
-        // connect + list.
+        // One current-thread runtime, moved into the listing: listings are
+        // sequential, so a single-thread runtime is enough.
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| WatchError::Subscribe {
                 message: format!("sftp_dir_poll: tokio runtime init failed: {e}"),
             })?;
-
         let timeout = Duration::from_millis(parsed.timeout_ms);
-        let conn = Arc::new(conn);
-
-        // Initial connect probe: a connect/list failure here means the watcher
-        // could never establish a baseline, so fail the subscription rather than
-        // spawn a thread that only ever logs retries.
-        rt.block_on(async {
-            tokio::time::timeout(timeout, sftp::list(&conn, &resolved))
-                .await
-                .map_err(|_| "initial sftp list timed out".to_owned())
-                .and_then(|r| r)
-        })
-        .map_err(|message| WatchError::Subscribe {
-            message: format!("sftp_dir_poll: initial connect/list failed: {message}"),
-        })?;
-
-        let poll = move || -> Result<Option<String>, String> {
-            let entries = rt.block_on(async {
-                tokio::time::timeout(timeout, sftp::list(&conn, &resolved))
-                    .await
-                    .map_err(|_| "sftp list timed out".to_owned())
-                    .and_then(|r| r)
-            })?;
-            Ok(Some(fingerprint_listing(&entries)))
+        let walk_options = WalkOptions {
+            recursive: parsed.recursive,
+            pattern,
+            max_files: parsed.max_files,
+            max_dirs: defaults::max_dirs(),
+        };
+        // A server that cannot be reached now is listed again at the next
+        // interval: the source is not lost to a transient outage.
+        let list = move || {
+            // The session drops inside the runtime that drives it.
+            let _runtime = rt.enter();
+            let deadline = tokio::time::Instant::now() + timeout;
+            let lister = within(&rt, deadline, SftpLister::open(&conn, &resolved))?;
+            walk(&walk_options, |dir| {
+                let entries = within(&rt, deadline, lister.list(dir))?;
+                Ok(entries.iter().filter_map(dir_item).collect())
+            })
         };
 
-        Ok(spawn_polling_watch(
+        spawn_inventory_watch(
             resource_uri,
-            Duration::from_millis(parsed.interval_ms),
+            InventoryOptions {
+                store: "sftp".into(),
+                location,
+                interval: Duration::from_millis(parsed.interval_ms),
+                start: parsed.start_at,
+                snapshot_bytes: parsed.snapshot_bytes,
+                max_in_flight: parsed.max_in_flight,
+                ack_timeout: Duration::from_millis(parsed.ack_timeout_ms),
+            },
+            resume,
             emit_event,
-            poll,
-        ))
+            list,
+        )
+    }
+
+    fn acknowledge(&self, watch_handle: &WatchHandleBox, position: &Value) {
+        acknowledge_inventory_watch(watch_handle, position);
     }
 
     fn cancel(&self, watch_handle: WatchHandleBox) {
-        cancel_polling_watch(watch_handle);
+        cancel_inventory_watch(watch_handle);
     }
 }
 
@@ -270,6 +312,17 @@ mod tests {
 
     fn emit_noop() -> Box<dyn Fn(&str) + Send + Sync + 'static> {
         Box::new(|_| {})
+    }
+
+    fn refused(spec: Value) -> String {
+        match plugin().watch("sftp://incoming", &spec, emit_noop()) {
+            Err(WatchError::InvalidSpec { message }) => message,
+            Err(other) => panic!("not a spec error: {other:?}"),
+            Ok(handle) => {
+                plugin().cancel(handle);
+                panic!("accepted {spec}");
+            }
+        }
     }
 
     #[test]
@@ -296,6 +349,9 @@ mod tests {
         assert_eq!(parsed.path, "");
         assert_eq!(parsed.interval_ms, 60_000);
         assert_eq!(parsed.timeout_ms, 10_000);
+        assert!(!parsed.recursive);
+        assert_eq!(parsed.max_files, 10_000);
+        assert_eq!(parsed.start_at, InventoryStart::Now);
         assert!(parsed.host_key_sha256.is_none());
     }
 
@@ -311,6 +367,9 @@ mod tests {
             "host_key_sha256": "SHA256:abc",
             "interval_ms": 30_000,
             "timeout_ms": 5_000,
+            "recursive": true,
+            "pattern": "**/*.csv",
+            "start_at": "existing",
         }))
         .unwrap();
         assert_eq!(parsed.port, 2222);
@@ -318,117 +377,68 @@ mod tests {
         assert_eq!(parsed.path, "incoming");
         assert_eq!(parsed.host_key_sha256.as_deref(), Some("SHA256:abc"));
         assert_eq!(parsed.interval_ms, 30_000);
-        assert_eq!(parsed.timeout_ms, 5_000);
+        assert!(parsed.recursive);
+        assert_eq!(parsed.start_at, InventoryStart::Existing);
     }
 
     #[test]
-    fn unknown_field_is_invalid_spec() {
-        let p = plugin();
-        assert!(matches!(
-            p.watch(
-                "sftp://incoming",
+    fn a_bad_spec_is_refused_before_anything_connects() {
+        let base = json!({ "host": "h", "username": "u", "password": "p", "accept_unknown_host_key": true });
+        let with = |extra: Value| {
+            let mut spec = base.clone();
+            for (k, v) in extra.as_object().unwrap() {
+                spec[k] = v.clone();
+            }
+            spec
+        };
+        assert!(refused(with(json!({ "bogus": true }))).contains("unknown field"));
+        assert!(refused(with(json!({ "path": "../etc" }))).contains(".."));
+        assert!(refused(with(json!({ "password": "cred://vault/sftp" }))).contains("cred://"));
+        assert!(
+            refused(json!({ "host": "h", "username": "u", "password": "p" })).contains("host key")
+        );
+        assert!(refused(with(json!({ "pattern": "[a" }))).contains("pattern"));
+        assert!(refused(with(json!({ "max_files": 0 }))).contains("max_files"));
+        assert!(refused(with(json!({ "interval_ms": 10 }))).contains("interval_ms"));
+    }
+
+    #[test]
+    fn an_unreachable_server_is_listed_again_not_a_failed_watch() {
+        let handle = plugin()
+            .watch(
+                "mcpg-event://inbox",
                 &json!({
-                    "host": "h",
+                    "host": "127.0.0.1",
+                    "port": 1,
                     "username": "u",
                     "password": "p",
                     "accept_unknown_host_key": true,
-                    "bogus": true,
+                    "timeout_ms": 200,
+                    "interval_ms": 250,
                 }),
                 emit_noop(),
-            ),
-            Err(WatchError::InvalidSpec { .. })
-        ));
+            )
+            .expect("the watch starts and retries in the background");
+        std::thread::sleep(Duration::from_millis(300));
+        plugin().cancel(handle);
     }
 
     #[test]
-    fn traversal_path_is_invalid_spec() {
-        let p = plugin();
-        assert!(matches!(
-            p.watch(
-                "sftp://incoming",
-                &json!({
-                    "host": "h",
-                    "username": "u",
-                    "password": "p",
-                    "accept_unknown_host_key": true,
-                    "path": "../etc",
-                }),
-                emit_noop(),
-            ),
-            Err(WatchError::InvalidSpec { .. })
-        ));
-    }
-
-    #[test]
-    fn cred_password_is_invalid_spec() {
-        let p = plugin();
-        assert!(matches!(
-            p.watch(
-                "sftp://incoming",
-                &json!({
-                    "host": "h",
-                    "username": "u",
-                    "password": "cred://vault/sftp",
-                    "accept_unknown_host_key": true,
-                }),
-                emit_noop(),
-            ),
-            Err(WatchError::InvalidSpec { .. })
-        ));
-    }
-
-    #[test]
-    fn unconfigured_host_key_is_invalid_spec() {
-        let p = plugin();
-        assert!(matches!(
-            p.watch(
-                "sftp://incoming",
-                &json!({ "host": "h", "username": "u", "password": "p" }),
-                emit_noop(),
-            ),
-            Err(WatchError::InvalidSpec { .. })
-        ));
-    }
-
-    #[test]
-    fn fingerprint_is_stable_and_order_independent() {
-        let a = vec![
-            json!({ "name": "a.txt", "size": 10, "mtime": 100 }),
-            json!({ "name": "b.txt", "size": 20, "mtime": 200 }),
-        ];
-        // Same entries, reversed listing order → identical fingerprint.
-        let b = vec![
-            json!({ "name": "b.txt", "size": 20, "mtime": 200 }),
-            json!({ "name": "a.txt", "size": 10, "mtime": 100 }),
-        ];
-        assert_eq!(fingerprint_listing(&a), fingerprint_listing(&b));
-    }
-
-    #[test]
-    fn fingerprint_changes_on_add_remove_modify() {
-        let base = vec![
-            json!({ "name": "a.txt", "size": 10, "mtime": 100 }),
-            json!({ "name": "b.txt", "size": 20, "mtime": 200 }),
-        ];
-        let base_fp = fingerprint_listing(&base);
-
-        // A file added.
-        let added = vec![
-            json!({ "name": "a.txt", "size": 10, "mtime": 100 }),
-            json!({ "name": "b.txt", "size": 20, "mtime": 200 }),
-            json!({ "name": "c.txt", "size": 30, "mtime": 300 }),
-        ];
-        assert_ne!(base_fp, fingerprint_listing(&added));
-
-        // A file removed.
-        let removed = vec![json!({ "name": "a.txt", "size": 10, "mtime": 100 })];
-        assert_ne!(base_fp, fingerprint_listing(&removed));
-
-        // A file modified (size + mtime moved).
-        let modified = vec![
-            json!({ "name": "a.txt", "size": 11, "mtime": 101 }),
-            json!({ "name": "b.txt", "size": 20, "mtime": 200 }),
-        ];
-        assert_ne!(base_fp, fingerprint_listing(&modified));
+    fn listing_entries_become_files_and_directories() {
+        assert_eq!(
+            dir_item(&json!({ "name": "a.csv", "type": "file", "size": 10, "mtime": 100 })),
+            Some(DirItem {
+                name: "a.csv".into(),
+                is_dir: false,
+                size: Some(10),
+                modified_at_ms: Some(100_000),
+            })
+        );
+        assert!(
+            dir_item(&json!({ "name": "sub", "type": "dir" }))
+                .unwrap()
+                .is_dir
+        );
+        assert_eq!(dir_item(&json!({ "name": "l", "type": "symlink" })), None);
     }
 }

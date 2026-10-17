@@ -1,13 +1,13 @@
 [package]
 name = "mcpg-plugin-backend-sftp"
-version = "0.1.0-alpha.42"
+version = "0.1.0-alpha.43"
 license = "Apache-2.0"
 edition = "2024"
 description = """
 SFTP (SSH file transfer) backend binding plugin for mcpg. Lists a directory,
 gets a file, or puts a file over SSH (russh + russh-sftp) as MCP
-tools/resources — with path-traversal defense and a size cap. FTP (suppaftp)
-and SMB (pavao) are deferred follow-ons.
+tools/resources — with path-traversal defense and a size cap — and watches a
+directory, each file created, modified or deleted as an MCP Event.
 """
 
 [lib]
@@ -22,9 +22,9 @@ static-firstparty = []
 integration-tests = []
 
 [dependencies]
-mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-beta.39", version = "=0.1.0-beta.39" }
-mcpg-plugin-sdk      = { git = "https://github.com/mcpg-dev/mcpg-plugin-sdk", tag = "v0.1.0-beta.40", version = "=0.1.0-beta.40", features = ["static-firstparty"] }
-mcpg-plugin-host     = { git = "https://github.com/mcpg-dev/mcpg-plugin-host", tag = "v0.1.0-beta.41", version = "=0.1.0-beta.41" }
+mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-beta.40", version = "=0.1.0-beta.40" }
+mcpg-plugin-sdk      = { git = "https://github.com/mcpg-dev/mcpg-plugin-sdk", tag = "v0.1.0-beta.41", version = "=0.1.0-beta.41", features = ["static-firstparty"] }
+mcpg-plugin-host     = { git = "https://github.com/mcpg-dev/mcpg-plugin-host", tag = "v0.1.0-beta.42", version = "=0.1.0-beta.42" }
 async-trait    = "0.1"
 base64         = "0.23"
 chrono         = { version = "0.4", features = ["clock"] }
